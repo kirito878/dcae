@@ -1,0 +1,6 @@
+*.png
+*.tar
+*.pyc
+*.csv
+*.txt
+.vscode/*
