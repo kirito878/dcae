@@ -99,6 +99,41 @@ def get_wd_sigma_fn(mode="static", saliency_model=None, sigma_max=16.0,
     return compute_wd_sigma
 
 
+# ══════════════════════════════════════════════════════
+# MSD grass mask: high-freq(排天空) AND not-saliency(排飞机)
+# 与 WD 的 σ-map 完全分开,用独立的 saliency model
+# 已验证分区: 草地59% 飞机0% 天空0%
+# ══════════════════════════════════════════════════════
+def grass_mask_fn(target, saliency_model, blur_ks=15, hf_pct=0.5, sal_pct=0.5):
+    B, _, H, W = target.shape
+    pad = blur_ks // 2
+
+    def _reflect_avgpool(x):
+        x = F.pad(x, (pad, pad, pad, pad), mode='reflect')
+        return F.avg_pool2d(x, blur_ks, 1, 0)
+
+    gray = target.mean(1, keepdim=True)
+    low  = _reflect_avgpool(gray)
+    high = _reflect_avgpool((gray - low).abs())
+    hf_thr = high.flatten(1).quantile(hf_pct, 1).view(B, 1, 1, 1)
+    hf_mask = (high > hf_thr).float()
+
+    sal = saliency_model(target)
+    sal = TF.gaussian_blur(sal, kernel_size=[31, 31], sigma=[5.0, 5.0])
+    sal_thr = sal.flatten(1).quantile(sal_pct, 1).view(B, 1, 1, 1)
+    not_sal = (sal < sal_thr).float()
+
+    mask = hf_mask * not_sal
+
+    # 保險:最外圈一律歸零,MSD 就不會在邊界被拉動
+    m = max(pad, 8)
+    mask[:, :, :m, :] = 0
+    mask[:, :, -m:, :] = 0
+    mask[:, :, :, :m] = 0
+    mask[:, :, :, -m:] = 0
+    return mask
+
+
 def log_metrics(experiment, metrics: dict, step: int):
     if experiment is not None:
         experiment.log_metrics(metrics, step=step)
@@ -322,6 +357,7 @@ def configure_optimizers(net, args):
         )
     return optimizer, aux_optimizer
 
+
 def _is_finite_tensor(value):
     return torch.isfinite(value).all().item()
 
@@ -495,6 +531,13 @@ def parse_args(argv):
     parser.add_argument("--msd-weight", type=float, default=0.0,
                         help="Mode-seeking diversity loss weight "
                              "(需要 model forward 為 stochastic 才有意義)")
+    # ---- MSD grass mask (high-freq AND not-saliency) ----
+    parser.add_argument("--msd-mask-blur-ks", type=int, default=15,
+                        help="局部高频窗口大小(草地纹理检测)")
+    parser.add_argument("--msd-mask-hf-pct", type=float, default=0.5,
+                        help="高频阈值分位数(排天空,越高越严格)")
+    parser.add_argument("--msd-mask-sal-pct", type=float, default=0.5,
+                        help="saliency阈值分位数(排飞机,越低越严格)")
 
     parser.add_argument("--lpips-weight", type=float, default=0.0,
                         help="LPIPS perceptual loss weight")
@@ -546,6 +589,29 @@ def main(argv):
           f"p_min={args.wd_sigma_p_min}")
 
     # ══════════════════════════════════════════════════════
+    # 1.2 MSD 专用 saliency model（与 WD 的 σ-map 完全分开）
+    #     grass mask = high-freq AND not-saliency
+    # ══════════════════════════════════════════════════════
+    msd_saliency_model = None
+    if args.msd_weight > 0:
+        if saliency_model is not None:
+            # WD 已用 saliency 模式,复用同一个 model(仅前向,互不干扰)
+            msd_saliency_model = saliency_model
+            print("[MSD] reuse WD's saliency model for grass mask.")
+        else:
+            # WD 是 static,单独为 MSD 建一个 saliency model
+            msd_saliency_model = EMLNetSaliency(
+                args.emlnet_imagenet_path,
+                args.emlnet_places_path,
+                args.emlnet_decoder_path,
+            ).to(DEVICE)
+            msd_saliency_model.eval()
+            for p in msd_saliency_model.parameters():
+                p.requires_grad = False
+            print("[MSD] independent saliency model loaded for grass mask "
+                  "(separate from WD static sigma).")
+
+    # ══════════════════════════════════════════════════════
     # 1.5 LPIPS model
     # ══════════════════════════════════════════════════════
     if args.lpips_weight > 0:
@@ -553,7 +619,8 @@ def main(argv):
         for p in lpips_fn.parameters():
             p.requires_grad = False
         lpips_fn.eval()
-        print(f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
+        print(
+            f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
     else:
         lpips_fn = None
         print("LPIPS: disabled.")
@@ -645,7 +712,7 @@ def main(argv):
             if isinstance(ckpt_raw, dict) and "iterations" in ckpt_raw:
                 iterations = int(ckpt_raw["iterations"])
                 print(f"[Resume] iterations set to {iterations}")
-                iterations = 0 # 從頭開始訓練 NoiseTransform，iteration 計數器也從頭開始，確保 WD warmup schedule 正確運作。
+                iterations = 0  # 從頭開始訓練 NoiseTransform，iteration 計數器也從頭開始，確保 WD warmup schedule 正確運作。
         except Exception as e:
             print(f"[Resume] could not read iterations: {e}")
 
@@ -677,7 +744,8 @@ def main(argv):
 
     print(f"[Training] λ={args.lmbda}, wd_weight={args.wd_weight}, "
           f"mse_weight={args.mse_weight} → {args.final_mse_weight}")
-    print(f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
+    print(
+        f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
 
     # ══════════════════════════════════════════════════════
     # 7. Training loop
@@ -701,20 +769,25 @@ def main(argv):
             out_net = net(d)
             out_criterion = criterion(out_net, d)
 
-            # ─── MSD loss ───
-            # ─── MSD loss (masked: 只在 realism 区/草地施加 diversity) ───
+            # ─── MSD loss (masked: 只在草地施加 diversity) ───
+            # grass mask = high-freq(排天空) AND not-saliency(排飞机)
+            # 与 WD 的 σ-map 完全分开,用独立的 msd_saliency_model
             msd_loss = torch.tensor(0.0, device=device)
             delta_x = torch.tensor(0.0, device=device)
             if args.msd_weight > 0:
                 out_net_alt = net(d)
-                # 用 σ-map 当 mask: σ 大 = realism = 该多样化的区域
                 with torch.no_grad():
-                    wd_sigma = get_wd_sigma(d)                    # (B,1,H,W)
-                    thr = wd_sigma.flatten(1).median(dim=1)[0].view(-1, 1, 1, 1)
-                    realism_mask = (wd_sigma > thr).float()       # (B,1,H,W) 草地(+天空)=1
-                delta = (out_net["x_hat"] - out_net_alt["x_hat"]).abs().mean(1, keepdim=True)
-                # 只统计 realism 区的多样性
-                delta_x = (delta * realism_mask).sum() / (realism_mask.sum() + 1e-6)
+                    grass_mask = grass_mask_fn(
+                        d, msd_saliency_model,
+                        blur_ks=args.msd_mask_blur_ks,
+                        hf_pct=args.msd_mask_hf_pct,
+                        sal_pct=args.msd_mask_sal_pct,
+                    )                                             # (B,1,H,W) 草地=1
+                delta = (out_net["x_hat"] - out_net_alt["x_hat"]
+                         ).abs().mean(1, keepdim=True)
+                # 只统计草地的多样性(分母是草地面积,不被天空飞机稀释)
+                delta_x = (delta * grass_mask).sum() / \
+                    (grass_mask.sum() + 1e-6)
                 msd_loss = -torch.log(delta_x + 1e-6)
 
             # ─── Total loss ───
@@ -791,9 +864,11 @@ def main(argv):
                     f'w_mse {criterion.mse_weight:.3f} w_wd {criterion.wd_weight:.3f}',
                 ]))
                 if args.msd_weight > 0:
-                    ratio = (args.msd_weight * msd_loss / out_criterion["loss"]).abs()
+                    ratio = (args.msd_weight * msd_loss /
+                             out_criterion["loss"]).abs()
+                    gcov = grass_mask.mean().item()
                     print(f"delta_x={delta_x.item():.5f}  msd_loss={msd_loss.item():.4f}  "
-                          f"ratio={ratio.item():.2%}")
+                          f"ratio={ratio.item():.2%}  grass_mask_cover={gcov:.2%}")
                 start_time = time.time()
 
                 log_dict = {
@@ -812,7 +887,7 @@ def main(argv):
                 log_metrics(experiment, log_dict, step=iterations)
 
             # 驗證
-            if (iterations % 1000 == 0 and iterations != 0):
+            if (iterations % 500 == 0 and iterations != 0):
                 print(f"[VAL] iterations={iterations}")
                 net.eval()
                 loss = test_epoch(iterations, test_dataloader,
