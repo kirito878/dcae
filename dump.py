@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
-from models import DCAE  # 需与本脚本同目录
+from models.dcae import DCAE  # 需与本脚本同目录
 
 
 # ----------------------------- 工具 -----------------------------

@@ -21,10 +21,48 @@ from pytorch_msssim import ms_ssim
 import lpips
 
 from utils.Meter import AverageMeterTEST, AverageMeterTRAIN
-from models.dcae_3 import DCAE
-
+from models import DCAE
+from models.dcae import NoiseInjectedResBlock
 import emlnet.decoder as eml_decoder
 import emlnet.resnet as eml_resnet
+
+
+def collect_gates(net):
+    base = net.module if hasattr(net, "module") else net
+    gates = []
+    for m in base.modules():
+        if isinstance(m, NoiseInjectedResBlock) and m.last_gates is not None:
+            gates.extend(m.last_gates)
+    return gates
+
+
+def gate_binarization_loss(gates, device="cuda"):
+    """懲罰中間值,逼 gate 往 0 或 1 兩極。g*(1-g) 在 g=0.5 最大、g=0/1 為 0。"""
+    if not gates:
+        return torch.tensor(0.0, device=device)
+    per_gate = torch.stack([(g * (1 - g)).mean() for g in gates])
+    return per_gate.mean()
+def gate_sparsity_loss(gates, budget=0.20, budget_low=0.08, device="cuda"):
+    """
+    約束 gate 開啟面積在 [budget_low, budget_high] 之間。
+    上限:避免注入範圍過大污染平滑區。
+    下限:避免兩極化後面積縮太小、草地蓋不滿。
+    """
+    if not gates:
+        return torch.tensor(0.0, device=device)
+    per_gate = torch.stack([g.mean() for g in gates])  # [num_gates]
+
+    penalty_upper = F.relu(per_gate - budget)     # 超過上限才罰
+    penalty_lower = F.relu(budget_low - per_gate)      # 低於下限才罰
+    gb_loss = gate_binarization_loss(gates, device=device)  # 懲罰中間值
+    return (penalty_upper + penalty_lower).mean() + gb_loss * 0.2
+
+
+def gate_tv_loss(gates, device="cuda"):
+    """對 gate map 做 TV,壓掉天空那種散點式(salt-and-pepper)開啟。"""
+    if not gates:
+        return torch.tensor(0.0, device=device)
+    return sum(calc_tv_loss(g) for g in gates) / len(gates)
 
 
 def calc_tv_loss(x):
@@ -119,8 +157,8 @@ try:
     wd_fn = VGG16WaveletWassersteinDistortion(
         num_levels=5, dwt_levels=1,
         learnable_weights=False,          # 关掉,别让它自己推向 HH
-        sigma_offsets=(-0.5, 0.0, 0.0, 0.0),  # HH 从 1.0 降到 0.5,别过度realism
-        ll_weight_boost=0.3,              # LL 温和回补一点(不是之前的1.0)
+        # sigma_offsets=(-0.5, 0.0, 0.0, 0.0),  # HH 从 1.0 降到 0.5,别过度realism
+        # ll_weight_boost=0.3,              # LL 温和回补一点(不是之前的1.0)
     ).to(DEVICE)
     for p in wd_fn.parameters():
         p.requires_grad_(False)
@@ -287,40 +325,60 @@ class CustomDataParallel(nn.DataParallel):
 #             lr=args.aux_learning_rate,
 #         )
 #     return optimizer, aux_optimizer
+import torch.optim as optim
+
 def configure_optimizers(net, args):
-    # nt_param_names = set()
-    # for module_name, module in net.named_modules():
-    #     if module.__class__.__name__ == "NoiseTransform":
-    #         for param_name, _ in module.named_parameters(recurse=True):
-    #             full_name = f"{module_name}.{param_name}" if module_name else param_name
-    #             nt_param_names.add(full_name)
+    base_trainable = set()
+    slow_trainable = set()   # gate + noise_scale + output_proj:stage 1 已學好,stage 2 只保護
 
-    # for name, param in net.named_parameters():
-    #     param.requires_grad = name in nt_param_names
+    # 低 lr 群組的名稱特徵。output_proj 只匹配 NT 內部那顆,
+    # 避免誤傷模型其他可能叫 output_proj 的層(目前沒有,但寫嚴一點)。
+    def is_slow(name):
+        if "gate" in name:
+            return True
+        # if "noise_scale" in name:
+        #     return True
+        if "noise_transform" in name and "output_proj" in name:
+            return True
+        return False
 
-    trainable = {
-        n for n, p in net.named_parameters()
-        if p.requires_grad and not n.endswith(".quantiles")
-    }
+    for n, p in net.named_parameters():
+        if p.requires_grad and not n.endswith(".quantiles"):
+            if is_slow(n):
+                slow_trainable.add(n)
+            else:
+                base_trainable.add(n)
+
     aux_parameters = {
         n for n, p in net.named_parameters()
         if n.endswith(".quantiles") and p.requires_grad
     }
 
     params_dict = dict(net.named_parameters())
-    print(f"[Optimizer] Trainable NoiseTransform params: {len(trainable)}")
+    print(f"[Optimizer] Base trainable params: {len(base_trainable)}")
+    print(f"[Optimizer] Slow (gate/noise_scale/output_proj) params: {len(slow_trainable)}")
+    # 印出來確認真的抓到東西,別再出現上次那種「以為凍了其實沒凍」
+    for n in sorted(slow_trainable):
+        print(f"    [slow] {n}")
 
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(trainable)),
-        lr=args.learning_rate,
-    )
+    slow_lr = args.learning_rate * getattr(args, "gate_lr_mult", 0.05)
+
+    optimizer = optim.Adam([
+        {"params": [params_dict[n] for n in sorted(base_trainable)],
+         "lr": args.learning_rate},
+        {"params": [params_dict[n] for n in sorted(slow_trainable)],
+         "lr": slow_lr},
+    ])
+
     aux_optimizer = None
     if aux_parameters:
         aux_optimizer = optim.Adam(
             (params_dict[n] for n in sorted(aux_parameters)),
             lr=args.aux_learning_rate,
         )
+
     return optimizer, aux_optimizer
+
 
 def _is_finite_tensor(value):
     return torch.isfinite(value).all().item()
@@ -503,6 +561,11 @@ def parse_args(argv):
                         help="LPIPS backbone network")
     parser.add_argument("--tv-weight", type=float, default=0.0,
                         help="Total Variation loss weight")
+    parser.add_argument("--gate-weight", type=float, default=0.0)
+    parser.add_argument("--gate-budget", type=float,
+                        default=0.0)   # 例如 0.1 = 允許平均 10% 開
+    parser.add_argument("--gate-tv-weight", type=float, default=0.0)
+    parser.add_argument("--margin", type=float, default=0.005)
     args = parser.parse_args(argv)
     return args
 
@@ -553,7 +616,8 @@ def main(argv):
         for p in lpips_fn.parameters():
             p.requires_grad = False
         lpips_fn.eval()
-        print(f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
+        print(
+            f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
     else:
         lpips_fn = None
         print("LPIPS: disabled.")
@@ -570,6 +634,9 @@ def main(argv):
         if args.comet_name:
             experiment.set_name(args.comet_name)
         experiment.log_parameters(vars(args))
+        experiment.log_code(
+            file_name="/home/at9529/ycw.cs14/Michael/massive_activation/DCAE/models/dcae.py"
+        )
     else:
         experiment = None
 
@@ -645,7 +712,7 @@ def main(argv):
             if isinstance(ckpt_raw, dict) and "iterations" in ckpt_raw:
                 iterations = int(ckpt_raw["iterations"])
                 print(f"[Resume] iterations set to {iterations}")
-                iterations = 0 # 從頭開始訓練 NoiseTransform，iteration 計數器也從頭開始，確保 WD warmup schedule 正確運作。
+                iterations = 0  # 從頭開始訓練 NoiseTransform，iteration 計數器也從頭開始，確保 WD warmup schedule 正確運作。
         except Exception as e:
             print(f"[Resume] could not read iterations: {e}")
 
@@ -677,7 +744,8 @@ def main(argv):
 
     print(f"[Training] λ={args.lmbda}, wd_weight={args.wd_weight}, "
           f"mse_weight={args.mse_weight} → {args.final_mse_weight}")
-    print(f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
+    print(
+        f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
 
     # ══════════════════════════════════════════════════════
     # 7. Training loop
@@ -700,7 +768,10 @@ def main(argv):
             # ─── Forward ───
             out_net = net(d)
             out_criterion = criterion(out_net, d)
-
+            gates = collect_gates(net)
+            gate_l1 = gate_sparsity_loss(
+                gates, budget=args.gate_budget, device=device)
+            gate_tv = gate_tv_loss(gates, device=device)
             # ─── MSD loss ───
             msd_loss = torch.tensor(0.0, device=device)
             delta_x = torch.tensor(0.0, device=device)
@@ -708,11 +779,14 @@ def main(argv):
                 out_net_alt = net(d)
                 delta_x = torch.mean(
                     torch.abs(out_net["x_hat"] - out_net_alt["x_hat"]))
-                msd_loss = -torch.log(delta_x + 1e-6)
-
+                margin = args.margin
+                msd_loss = torch.clamp(margin - delta_x, min=0.0)
             # ─── Total loss ───
-            total_loss = out_criterion["loss"] + args.msd_weight * msd_loss
 
+            total_loss = (out_criterion["loss"]
+                          + args.msd_weight * msd_loss
+                          + args.gate_weight * gate_l1
+                          + args.gate_tv_weight * gate_tv)
             if not _criterion_is_finite(out_criterion) or not _is_finite_tensor(total_loss):
                 print(
                     f"[Skip] Non-finite loss at epoch {epoch}, "
@@ -784,7 +858,8 @@ def main(argv):
                     f'w_mse {criterion.mse_weight:.3f} w_wd {criterion.wd_weight:.3f}',
                 ]))
                 if args.msd_weight > 0:
-                    ratio = (args.msd_weight * msd_loss / out_criterion["loss"]).abs()
+                    ratio = (args.msd_weight * msd_loss /
+                             out_criterion["loss"]).abs()
                     print(f"delta_x={delta_x.item():.5f}  msd_loss={msd_loss.item():.4f}  "
                           f"ratio={ratio.item():.2%}")
                 start_time = time.time()
@@ -798,6 +873,7 @@ def main(argv):
                     "train/wd": wd_losses.val,
                     "train/msd": msd_losses.val,
                     "train/aux_loss": aux_losses.val,
+                    "train/gate_mean": torch.stack([g.mean() for g in gates]).mean().item() if gates else 0.0,
                     "lr": optimizer.param_groups[0]['lr'],
                     "weights/mse": criterion.mse_weight,
                     "weights/wd": criterion.wd_weight,
@@ -805,7 +881,7 @@ def main(argv):
                 log_metrics(experiment, log_dict, step=iterations)
 
             # 驗證
-            if (iterations % 1000 == 0 and iterations != 0):
+            if (iterations % 300 == 0 and iterations != 0):
                 print(f"[VAL] iterations={iterations}")
                 net.eval()
                 loss = test_epoch(iterations, test_dataloader,

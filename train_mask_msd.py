@@ -21,22 +21,28 @@ from pytorch_msssim import ms_ssim
 import lpips
 
 from utils.Meter import AverageMeterTEST, AverageMeterTRAIN
-from models import DCAE
+from models.dcae_gate import DCAE
 
 import emlnet.decoder as eml_decoder
 import emlnet.resnet as eml_resnet
-
+from mask_utils import stochastic_mask_fn
+from torchvision.utils import save_image
+from PIL import Image
 
 def calc_tv_loss(x):
-    """
-    計算 Total Variation Loss
-    x: 最終輸出的重構影像 (B, C, H, W)
-    """
+    """計算 Total Variation Loss"""
     tv_h = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
     tv_w = torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
     return tv_h + tv_w
 
-
+def _to_comet_img(t):
+    """(C,H,W) tensor in [0,1] -> (H,W,C) uint8 numpy for comet."""
+    t = t.detach().cpu().clamp(0, 1)
+    if t.dim() == 3 and t.size(0) == 1:      # 單通道 gate -> (H,W)
+        arr = (t[0].numpy() * 255).astype('uint8')      # (H,W) 灰階
+    else:                                    # 三通道 input -> (H,W,3)
+        arr = (t.permute(1, 2, 0).numpy() * 255).astype('uint8')
+    return arr
 # ══════════════════════════════════════════════════════
 # EML-net saliency wrapper + WD sigma factory
 # ══════════════════════════════════════════════════════
@@ -99,41 +105,6 @@ def get_wd_sigma_fn(mode="static", saliency_model=None, sigma_max=16.0,
     return compute_wd_sigma
 
 
-# ══════════════════════════════════════════════════════
-# MSD grass mask: high-freq(排天空) AND not-saliency(排飞机)
-# 与 WD 的 σ-map 完全分开,用独立的 saliency model
-# 已验证分区: 草地59% 飞机0% 天空0%
-# ══════════════════════════════════════════════════════
-def grass_mask_fn(target, saliency_model, blur_ks=15, hf_pct=0.5, sal_pct=0.5):
-    B, _, H, W = target.shape
-    pad = blur_ks // 2
-
-    def _reflect_avgpool(x):
-        x = F.pad(x, (pad, pad, pad, pad), mode='reflect')
-        return F.avg_pool2d(x, blur_ks, 1, 0)
-
-    gray = target.mean(1, keepdim=True)
-    low  = _reflect_avgpool(gray)
-    high = _reflect_avgpool((gray - low).abs())
-    hf_thr = high.flatten(1).quantile(hf_pct, 1).view(B, 1, 1, 1)
-    hf_mask = (high > hf_thr).float()
-
-    sal = saliency_model(target)
-    sal = TF.gaussian_blur(sal, kernel_size=[31, 31], sigma=[5.0, 5.0])
-    sal_thr = sal.flatten(1).quantile(sal_pct, 1).view(B, 1, 1, 1)
-    not_sal = (sal < sal_thr).float()
-
-    mask = hf_mask * not_sal
-
-    # 保險:最外圈一律歸零,MSD 就不會在邊界被拉動
-    m = max(pad, 8)
-    mask[:, :, :m, :] = 0
-    mask[:, :, -m:, :] = 0
-    mask[:, :, :, :m] = 0
-    mask[:, :, :, -m:] = 0
-    return mask
-
-
 def log_metrics(experiment, metrics: dict, step: int):
     if experiment is not None:
         experiment.log_metrics(metrics, step=step)
@@ -153,9 +124,9 @@ try:
     from wa_wd import VGG16WaveletWassersteinDistortion
     wd_fn = VGG16WaveletWassersteinDistortion(
         num_levels=5, dwt_levels=1,
-        learnable_weights=False,          # 关掉,别让它自己推向 HH
-        sigma_offsets=(-0.5, 0.0, 0.0, 0.0),  # HH 从 1.0 降到 0.5,别过度realism
-        ll_weight_boost=0.3,              # LL 温和回补一点(不是之前的1.0)
+        learnable_weights=False,
+        sigma_offsets=(-0.5, 0.0, 0.0, 0.0),
+        ll_weight_boost=0.3,
     ).to(DEVICE)
     for p in wd_fn.parameters():
         p.requires_grad_(False)
@@ -165,12 +136,10 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════
-# Rate-Distortion Perceptual Loss（支援 MSE+WD 動態權重）
+# Rate-Distortion Perceptual Loss
 # ══════════════════════════════════════════════════════
 class RateDistortionPerceptualLoss(nn.Module):
     """
-    Rate-distortion loss with WD + LPIPS perceptual loss.
-
     Loss = mse_weight * MSE + wd_weight * WD + lpips_weight * LPIPS
            + lmbda * bpp + tv_weight * TV
     """
@@ -220,7 +189,7 @@ class RateDistortionPerceptualLoss(nn.Module):
         else:
             out["wd_loss"] = torch.tensor(0.0, device=target.device)
 
-        # LPIPS loss（LPIPS 預期輸入範圍 [-1, 1]）
+        # LPIPS loss
         if self.lpips_fn is not None and self.lpips_weight > 0:
             x_hat_norm = 2.0 * output["x_hat"] - 1.0
             target_norm = 2.0 * target - 1.0
@@ -243,14 +212,6 @@ class RateDistortionPerceptualLoss(nn.Module):
 # WD Warmup Scheduler
 # ══════════════════════════════════════════════════════
 class WDWarmupScheduler:
-    """
-    控制 MSE → WD 的權重切換。
-
-    Phase 1 (warmup): 純 MSE
-    Phase 2 (transition): MSE 線性遞減，WD 線性遞增
-    Phase 3 (fine-tune): 最終權重
-    """
-
     def __init__(self, warmup_iters=0, transition_iters=15000,
                  initial_mse_weight=1.0, final_mse_weight=0.0,
                  final_wd_weight=0.05):
@@ -283,56 +244,7 @@ class CustomDataParallel(nn.DataParallel):
             return getattr(self.module, key)
 
 
-# def configure_optimizers(net, args):
-#     """凍結除了 NoiseTransform 以外的所有參數，只訓練新加進去的 NoiseTransform。"""
-#     nt_param_names = set()
-#     for module_name, module in net.named_modules():
-#         if module.__class__.__name__ == "NoiseTransform":
-#             for param_name, _ in module.named_parameters(recurse=True):
-#                 full_name = f"{module_name}.{param_name}" if module_name else param_name
-#                 nt_param_names.add(full_name)
-
-#     for name, param in net.named_parameters():
-#         param.requires_grad = name in nt_param_names
-
-#     trainable = {
-#         n for n, p in net.named_parameters()
-#         if p.requires_grad and not n.endswith(".quantiles")
-#     }
-#     aux_parameters = {
-#         n for n, p in net.named_parameters()
-#         if n.endswith(".quantiles") and p.requires_grad
-#     }
-
-#     params_dict = dict(net.named_parameters())
-#     print(f"[Optimizer] Trainable NoiseTransform params: {len(trainable)}")
-#     if len(trainable) == 0:
-#         raise RuntimeError(
-#             "找不到任何 NoiseTransform 參數可訓練。請確認 module 的 class "
-#             "名稱確實是 'NoiseTransform'，且已經加進 DCAE 的模型結構裡。")
-
-#     optimizer = optim.Adam(
-#         (params_dict[n] for n in sorted(trainable)),
-#         lr=args.learning_rate,
-#     )
-#     aux_optimizer = None
-#     if aux_parameters:
-#         aux_optimizer = optim.Adam(
-#             (params_dict[n] for n in sorted(aux_parameters)),
-#             lr=args.aux_learning_rate,
-#         )
-#     return optimizer, aux_optimizer
 def configure_optimizers(net, args):
-    # nt_param_names = set()
-    # for module_name, module in net.named_modules():
-    #     if module.__class__.__name__ == "NoiseTransform":
-    #         for param_name, _ in module.named_parameters(recurse=True):
-    #             full_name = f"{module_name}.{param_name}" if module_name else param_name
-    #             nt_param_names.add(full_name)
-
-    # for name, param in net.named_parameters():
-    #     param.requires_grad = name in nt_param_names
-
     trainable = {
         n for n, p in net.named_parameters()
         if p.requires_grad and not n.endswith(".quantiles")
@@ -343,7 +255,7 @@ def configure_optimizers(net, args):
     }
 
     params_dict = dict(net.named_parameters())
-    print(f"[Optimizer] Trainable NoiseTransform params: {len(trainable)}")
+    print(f"[Optimizer] Trainable params: {len(trainable)}")
 
     optimizer = optim.Adam(
         (params_dict[n] for n in sorted(trainable)),
@@ -388,9 +300,6 @@ def load_pretrained_state_dict(model, ckpt_path):
         else:
             skipped.append(key)
 
-    # 自己算 missing keys，不依賴 load_state_dict 的回傳值。
-    # DCAE / 某些 CompressAI 模型會 override load_state_dict 而不 return
-    # IncompatibleKeys（回傳 None），直接取 .missing_keys 會 AttributeError。
     missing_keys = [k for k in model_state.keys() if k not in new_state]
 
     msg = model.load_state_dict(new_state, strict=False)
@@ -529,15 +438,30 @@ def parse_args(argv):
     parser.add_argument("--skip-warmup", action="store_true",
                         help="Skip warmup, use final weights from start")
     parser.add_argument("--msd-weight", type=float, default=0.0,
-                        help="Mode-seeking diversity loss weight "
-                             "(需要 model forward 為 stochastic 才有意義)")
-    # ---- MSD grass mask (high-freq AND not-saliency) ----
+                        help="Mode-seeking diversity loss weight")
+
+    # ---- MSD grass mask (路線 A 保留,路線 B 下面用 gate) ----
     parser.add_argument("--msd-mask-blur-ks", type=int, default=15,
                         help="局部高频窗口大小(草地纹理检测)")
     parser.add_argument("--msd-mask-hf-pct", type=float, default=0.5,
                         help="高频阈值分位数(排天空,越高越严格)")
     parser.add_argument("--msd-mask-sal-pct", type=float, default=0.5,
                         help="saliency阈值分位数(排飞机,越低越严格)")
+    parser.add_argument("--msd-target-div", type=float, default=0.02,
+                        help="MSD 目標多樣性,delta_x 達標即不再推大")
+    parser.add_argument("--msd-mask-aniso-ks", type=int, default=7,
+                        help="anisotropy 局部窗口大小")
+    parser.add_argument("--msd-mask-aniso-pct", type=float, default=0.5,
+                        help="anisotropy 阈值分位数(排柵欄/牆,越低越严格)")
+    parser.add_argument("--msd-mask-use-aniso", action="store_true", default=True,
+                        help="启用 anisotropy 条件(路线A)")
+
+    # ---- 路線 B: gate-weighted MSD ----
+    parser.add_argument("--msd-use-gate", action="store_true", default=False,
+                        help="路線B:用 decoder gate 加權 MSD(取代硬 mask),"
+                             "gate 由 WD/LPIPS 決定,MSD 端 detach 不動 gate")
+    parser.add_argument("--msd-gate-min-sum", type=float, default=1.0,
+                        help="gate 總和低於此值時跳過 MSD(gate 幾乎全關,避免除零)")
 
     parser.add_argument("--lpips-weight", type=float, default=0.0,
                         help="LPIPS perceptual loss weight")
@@ -560,7 +484,7 @@ def main(argv):
     print(args)
 
     # ══════════════════════════════════════════════════════
-    # 1. Saliency model（如果用 saliency 模式）
+    # 1. Saliency model
     # ══════════════════════════════════════════════════════
     saliency_model = None
     if args.wd_sigma_mode == "saliency":
@@ -589,17 +513,14 @@ def main(argv):
           f"p_min={args.wd_sigma_p_min}")
 
     # ══════════════════════════════════════════════════════
-    # 1.2 MSD 专用 saliency model（与 WD 的 σ-map 完全分开）
-    #     grass mask = high-freq AND not-saliency
+    # 1.2 MSD 专用 saliency model(路線 A 用;路線 B 用 gate 時可不需要)
     # ══════════════════════════════════════════════════════
     msd_saliency_model = None
-    if args.msd_weight > 0:
+    if args.msd_weight > 0 and not args.msd_use_gate:
         if saliency_model is not None:
-            # WD 已用 saliency 模式,复用同一个 model(仅前向,互不干扰)
             msd_saliency_model = saliency_model
             print("[MSD] reuse WD's saliency model for grass mask.")
         else:
-            # WD 是 static,单独为 MSD 建一个 saliency model
             msd_saliency_model = EMLNetSaliency(
                 args.emlnet_imagenet_path,
                 args.emlnet_places_path,
@@ -608,8 +529,9 @@ def main(argv):
             msd_saliency_model.eval()
             for p in msd_saliency_model.parameters():
                 p.requires_grad = False
-            print("[MSD] independent saliency model loaded for grass mask "
-                  "(separate from WD static sigma).")
+            print("[MSD] independent saliency model loaded for grass mask.")
+    elif args.msd_weight > 0 and args.msd_use_gate:
+        print("[MSD] route B: gate-weighted MSD, no grass mask needed.")
 
     # ══════════════════════════════════════════════════════
     # 1.5 LPIPS model
@@ -619,8 +541,7 @@ def main(argv):
         for p in lpips_fn.parameters():
             p.requires_grad = False
         lpips_fn.eval()
-        print(
-            f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
+        print(f"LPIPS loaded (net={args.lpips_net}, weight={args.lpips_weight}).")
     else:
         lpips_fn = None
         print("LPIPS: disabled.")
@@ -676,6 +597,7 @@ def main(argv):
     net = DCAE()
     net = net.to(device)
     print(f"{count_params(net):.2f}M parameters")
+
     # ══════════════════════════════════════════════════════
     # 5. Loss + Warmup Scheduler
     # ══════════════════════════════════════════════════════
@@ -712,13 +634,10 @@ def main(argv):
             if isinstance(ckpt_raw, dict) and "iterations" in ckpt_raw:
                 iterations = int(ckpt_raw["iterations"])
                 print(f"[Resume] iterations set to {iterations}")
-                iterations = 0  # 從頭開始訓練 NoiseTransform，iteration 計數器也從頭開始，確保 WD warmup schedule 正確運作。
+                iterations = 0
         except Exception as e:
             print(f"[Resume] could not read iterations: {e}")
 
-    # ══════════════════════════════════════════════════════
-    # 6.5 建立 per-val checkpoint 資料夾
-    # ══════════════════════════════════════════════════════
     ckpt_name = args.comet_name if args.comet_name else "default"
     ckpt_epoch_dir = os.path.join("ckpt_epoch", ckpt_name)
     os.makedirs(ckpt_epoch_dir, exist_ok=True)
@@ -744,9 +663,35 @@ def main(argv):
 
     print(f"[Training] λ={args.lmbda}, wd_weight={args.wd_weight}, "
           f"mse_weight={args.mse_weight} → {args.final_mse_weight}")
-    print(
-        f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
-
+    print(f"[Training] warmup={args.warmup_iters}, transition={args.transition_iters}")
+    if args.msd_weight > 0:
+        mode = "gate-weighted (route B)" if args.msd_use_gate else "grass-mask (route A)"
+        print(f"[MSD] mode={mode}, target_div={args.msd_target_div}, weight={args.msd_weight}")
+# ══════════════════════════════════════════════════════
+    # gate 可視化用的固定測試圖 (Kodak 19, 20)
+    # ══════════════════════════════════════════════════════
+    gate_vis_imgs = None
+    if args.msd_weight > 0 :
+        kodak_dir = "/home/at9529/ycw.cs14/dataset/TestImage/Kodak"  # ← 依你實際路徑改
+        vis_paths = [
+            os.path.join(kodak_dir, "19.png"),
+            os.path.join(kodak_dir, "20.png"),
+        ]
+        vis_list = []
+        for p in vis_paths:
+            if os.path.exists(p):
+                img = Image.open(p).convert("RGB")
+                vis_list.append(transforms.ToTensor()(img))
+            else:
+                print(f"[GateVis] WARNING: {p} not found, skip.")
+        if vis_list:
+            # 兩張尺寸一致才能 stack(Kodak 都是 768x512 或 512x768,若不同則分開處理)
+            try:
+                gate_vis_imgs = torch.stack(vis_list).to(device)  # (2,3,H,W)
+            except RuntimeError:
+                # 尺寸不同(19 直的 20 橫的),各自 unsqueeze 分開存
+                gate_vis_imgs = [v.unsqueeze(0).to(device) for v in vis_list]
+            print(f"[GateVis] loaded {len(vis_list)} fixed images for gate viz.")
     # ══════════════════════════════════════════════════════
     # 7. Training loop
     # ══════════════════════════════════════════════════════
@@ -760,7 +705,6 @@ def main(argv):
             d = d.to(device)
             iterations += 1
 
-            # 更新 loss 權重（WD warmup schedule）
             if not args.skip_warmup:
                 mse_w, wd_w = wd_scheduler.get_weights(iterations)
                 criterion.set_weights(mse_weight=mse_w, wd_weight=wd_w)
@@ -769,41 +713,72 @@ def main(argv):
             out_net = net(d)
             out_criterion = criterion(out_net, d)
 
-            # ─── MSD loss (masked: 只在草地施加 diversity) ───
-            # grass mask = high-freq(排天空) AND not-saliency(排飞机)
-            # 与 WD 的 σ-map 完全分开,用独立的 msd_saliency_model
+            # ─── MSD loss ───
             msd_loss = torch.tensor(0.0, device=device)
             delta_x = torch.tensor(0.0, device=device)
+            gcov = 0.0
             if args.msd_weight > 0:
                 out_net_alt = net(d)
-                with torch.no_grad():
-                    grass_mask = grass_mask_fn(
-                        d, msd_saliency_model,
-                        blur_ks=args.msd_mask_blur_ks,
-                        hf_pct=args.msd_mask_hf_pct,
-                        sal_pct=args.msd_mask_sal_pct,
-                    )                                             # (B,1,H,W) 草地=1
                 delta = (out_net["x_hat"] - out_net_alt["x_hat"]
-                         ).abs().mean(1, keepdim=True)
-                # 只统计草地的多样性(分母是草地面积,不被天空飞机稀释)
-                delta_x = (delta * grass_mask).sum() / \
-                    (grass_mask.sum() + 1e-6)
-                msd_loss = -torch.log(delta_x + 1e-6)
+                         ).abs().mean(1, keepdim=True)   # (B,1,H,W)
+
+                if args.msd_use_gate:
+                    # ─── 路線 B: gate-weighted ───
+                    # gate 由 WD/LPIPS 決定,MSD 端 detach,只推 delta 不動 gate
+                    gate = out_net.get("gate", None)
+                    if gate is None:
+                        # 模型沒吐 gate(理論上不會),退回不加 MSD
+                        msd_loss = torch.tensor(0.0, device=device)
+                    else:
+                        gate_w = gate.detach()
+                        # gate 尺寸可能是 x_hat 的一半,upsample 對齊 delta
+                        if gate_w.shape[-2:] != delta.shape[-2:]:
+                            gate_w = F.interpolate(
+                                gate_w, size=delta.shape[-2:],
+                                mode='bilinear', align_corners=False)
+                        gate_sum = gate_w.sum()
+                        gcov = gate_w.mean().item()
+                        if gate_sum < args.msd_gate_min_sum:
+                            # gate 幾乎全關,跳過(避免除零 + 沒必要推)
+                            msd_loss = torch.tensor(0.0, device=device)
+                            delta_x = torch.tensor(0.0, device=device)
+                        else:
+                            delta_x = (delta * gate_w).sum() / (gate_sum + 1e-6)
+                            if args.msd_target_div > 0:
+                                msd_loss = (args.msd_target_div - delta_x).clamp(min=0)
+                            else:
+                                msd_loss = -torch.log(delta_x + 1e-6)
+
+                else:
+                    # ─── 路線 A: grass-mask ───
+                    with torch.no_grad():
+                        grass_mask = stochastic_mask_fn(
+                            d, msd_saliency_model,
+                            blur_ks=args.msd_mask_blur_ks,
+                            hf_pct=args.msd_mask_hf_pct,
+                            sal_pct=args.msd_mask_sal_pct,
+                            aniso_ks=args.msd_mask_aniso_ks,
+                            aniso_pct=args.msd_mask_aniso_pct,
+                            use_aniso=args.msd_mask_use_aniso,
+                        )
+                        
+                    delta_x = (delta * grass_mask).sum() / (grass_mask.sum() + 1e-6)
+                    if args.msd_target_div > 0:
+                        msd_loss = (args.msd_target_div - delta_x).clamp(min=0)
+                    else:
+                        msd_loss = -torch.log(delta_x + 1e-6)
+                    gcov = grass_mask.mean().item()
 
             # ─── Total loss ───
             total_loss = out_criterion["loss"] + args.msd_weight * msd_loss
 
             if not _criterion_is_finite(out_criterion) or not _is_finite_tensor(total_loss):
-                print(
-                    f"[Skip] Non-finite loss at epoch {epoch}, "
-                    f"iter {iterations} (loss={total_loss.item()})."
-                )
+                print(f"[Skip] Non-finite loss at epoch {epoch}, "
+                      f"iter {iterations} (loss={total_loss.item()}).")
                 continue
             if total_loss.item() > args.skip_loss_threshold and epoch > 0:
-                print(
-                    f"[Skip] Loss>{args.skip_loss_threshold} at epoch {epoch}, "
-                    f"iter {iterations} (loss={total_loss.item():.4f})."
-                )
+                print(f"[Skip] Loss>{args.skip_loss_threshold} at epoch {epoch}, "
+                      f"iter {iterations} (loss={total_loss.item():.4f}).")
                 continue
 
             optimizer.zero_grad()
@@ -813,17 +788,14 @@ def main(argv):
             total_loss.backward()
 
             if args.clip_max_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    net.parameters(), args.clip_max_norm)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), args.clip_max_norm)
             optimizer.step()
 
             if aux_optimizer is not None:
                 aux_loss = net.aux_loss()
                 if not _is_finite_tensor(aux_loss):
-                    print(
-                        f"[Skip] Non-finite aux loss at epoch {epoch}, "
-                        f"iter {iterations} (aux_loss={aux_loss.item()})."
-                    )
+                    print(f"[Skip] Non-finite aux loss at epoch {epoch}, "
+                          f"iter {iterations} (aux_loss={aux_loss.item()}).")
                     continue
                 aux_loss.backward()
                 aux_optimizer.step()
@@ -866,9 +838,9 @@ def main(argv):
                 if args.msd_weight > 0:
                     ratio = (args.msd_weight * msd_loss /
                              out_criterion["loss"]).abs()
-                    gcov = grass_mask.mean().item()
+                    tag = "gate_cover" if args.msd_use_gate else "grass_mask_cover"
                     print(f"delta_x={delta_x.item():.5f}  msd_loss={msd_loss.item():.4f}  "
-                          f"ratio={ratio.item():.2%}  grass_mask_cover={gcov:.2%}")
+                          f"ratio={ratio.item():.2%}  {tag}={gcov:.2%}")
                 start_time = time.time()
 
                 log_dict = {
@@ -890,6 +862,50 @@ def main(argv):
             if (iterations % 500 == 0 and iterations != 0):
                 print(f"[VAL] iterations={iterations}")
                 net.eval()
+
+                # ─── gate 可視化 (固定 Kodak 19/20, 存 comet + 本地) ───
+                if args.msd_weight > 0  and gate_vis_imgs is not None:
+                    gate_dir = os.path.join("gate_vis", ckpt_name)
+                    os.makedirs(gate_dir, exist_ok=True)
+                    with torch.no_grad():
+                        # 支援 stack (同尺寸) 或 list (不同尺寸) 兩種情況
+                        vis_batches = ([gate_vis_imgs]
+                                       if torch.is_tensor(gate_vis_imgs)
+                                       else gate_vis_imgs)
+                        idx = 19  # Kodak 編號起點,用於命名
+                        for vb in vis_batches:
+                            vis_out = net(vb)
+                            gate = vis_out.get("gate", None)
+                            if gate is None:
+                                continue
+                            gate_up = F.interpolate(
+                                gate, size=vb.shape[-2:],
+                                mode='bilinear', align_corners=False)
+                            # 逐張存(vb 可能含 1 或 2 張)
+                            for b in range(vb.size(0)):
+                                name = f"kodim{idx}"
+                                # 
+                                g = gate_up[b]
+                                g_norm = (g - g.min()) / (g.max() - g.min() + 1e-8)   # 拉到 [0,1] 看相對
+                                save_image(g_norm, os.path.join(gate_dir, f"gate_{name}_norm_iter{iterations}.png"))
+                                save_image(gate_up[b], os.path.join(
+                                    gate_dir, f"gate_{name}_iter{iterations}.png"))
+                                # save_image(vb[b], os.path.join(
+                                #     gate_dir, f"input_{name}_iter{iterations}.png"))
+                                # comet
+                                if experiment is not None:
+                                    experiment.log_image(_to_comet_img(gate_up[b]),
+                                                        name=f"gate_{name}_iter{iterations}",
+                                                        step=iterations)
+                                    if iterations == 500:
+                                        experiment.log_image(_to_comet_img(vb[b]),
+                                                            name=f"input_{name}",
+                                                            step=iterations)
+                                print(f"[GateVis] {name} gate_cover="
+                                      f"{gate_up[b].mean().item():.2%}")
+                                idx += 1
+
+                # ─── 原本的驗證 ───
                 loss = test_epoch(iterations, test_dataloader,
                                   net, criterion, experiment=experiment)
                 log_metrics(experiment, {"val/loss": loss}, step=iterations)
@@ -909,17 +925,11 @@ def main(argv):
                         "best_loss": best_loss,
                     }
 
-                    # 每次 val 都存一份到 ckpt_epoch/<comet-name>/
-                    # epoch_ckpt_path = os.path.join(
-                    #     ckpt_epoch_dir,
-                    #     f"iter_{iterations}_loss_{float(loss):.4f}.pth.tar")
                     epoch_ckpt_path = os.path.join(
-                        ckpt_epoch_dir,
-                        f"iter_{iterations}.pth.tar")
+                        ckpt_epoch_dir, f"iter_{iterations}.pth.tar")
                     torch.save(save_obj, epoch_ckpt_path)
                     print(f"[Save] Per-val ckpt -> {epoch_ckpt_path}")
 
-                    # 保留原本的 best / 定期存檔
                     if is_best or iterations % 20000 == 0:
                         torch.save(save_obj, f"{args.save_path}")
                         print(f"[Save] Saved to {args.save_path}")
