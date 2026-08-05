@@ -83,56 +83,6 @@ class CleanResBlock(nn.Module):
         return x
 
 
-# class NoiseInjectedResBlock(nn.Module):
-#     """DepthConvBlock4 風格 + 在每個子區塊後注入噪聲。"""
-#     def __init__(self, ch, slope_depth_conv=0.01, inplace=False):
-#         super().__init__()
-#         self.depth_conv = DepthConv(ch, ch, slope=slope_depth_conv, inplace=inplace)
-#         self.ffn = ConvFFN3(ch, inplace=inplace)
-
-#         # 與原版相同：per-channel 可學的噪聲強度
-#         self.noise_scale1 = nn.Parameter(torch.ones(1, ch, 1, 1) * 0.01)
-#         self.noise_scale2 = nn.Parameter(torch.ones(1, ch, 1, 1) * 0.01)
-#         self.gate_1 = nn.Conv2d(ch, 1, 3, padding=1)   # 從 feature 預測空間 gate
-#         self.gate_2 = nn.Conv2d(ch, 1, 3, padding=1)   # 從 feature 預測空間 gate
-
-#         nn.init.constant_(self.gate_1.bias, -1.0)   # sigmoid(-2) ≈ 0.12
-#         nn.init.constant_(self.gate_2.bias, -1.0)
-
-#     # def forward(self, x, noise1, noise2):
-#     #     # 子區塊 1：DepthConv (已含內部 residual)
-#     #     out = self.depth_conv(x)
-#     #     g_1 = torch.sigmoid(self.gate_1(out))  # 空間 gate
-#     #     out = out + noise1 * self.noise_scale1 * g_1  
-#     #     # 子區塊 2：ConvFFN3 (已含內部 residual)
-#     #     out = self.ffn(out)
-#     #     g_2 = torch.sigmoid(self.gate_2(out))  # 空間 gate
-#     #     out = out + noise2 * self.noise_scale2 * g_2
-#     #     # img_tensor = g_2.detach().cpu().float()
-#     #     # from torchvision.utils import save_image
-#     #     # # 儲存圖片，若輸出資料夾不存在請自行建立
-#     #     # save_image(img_tensor, 'g_2_gate_visual.png')
-#     #     # img_tensor = g_1.detach().cpu().float()
-
-#     #     # # 儲存圖片，若輸出資料夾不存在請自行建立
-#     #     # save_image(img_tensor, 'g_1_gate_visual.png')
-#     #     # import pdb; pdb.set_trace()
-#     #     return out
-#     def forward(self, x, noise1, noise2):
-#         out = self.depth_conv(x)
-#         g_1 = torch.sigmoid(self.gate_1(out))
-        
-#         # 【關鍵】限制 scale 範圍，確保噪聲只影響微觀紋理，不影響宏觀結構
-#         scale_1 = torch.clamp(self.noise_scale1, min=-0.1, max=0.1) 
-        
-#         out = out + noise1 * scale_1 * g_1
-        
-#         out = self.ffn(out)
-#         g_2 = torch.sigmoid(self.gate_2(out))
-#         scale_2 = torch.clamp(self.noise_scale2, min=-0.1, max=0.1)
-#         out = out + noise2 * scale_2 * g_2
-        
-#         return out
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -167,6 +117,7 @@ class NoiseInjectedResBlock(nn.Module):
 
     def _apply_lpf(self, noise):
         # 多尺度混合,含高頻項
+        return noise  # 先回傳原始噪聲,不濾波
         scales = [(0, 1.0)]  # (0, w) 代表原始高頻 noise,不濾
         scales += [(random.choice([3,5]), 0.5), (random.choice([9,15]), 0.3)]
         out = 0

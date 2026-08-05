@@ -163,6 +163,7 @@ class NoiseTransform(nn.Module):
 
     def forward(self, cond):
         cond_distorted = cond
+        self.no_noise = True
         if hasattr(self, 'input_proj'):
             feat = self.input_proj(cond_distorted)
         else:
