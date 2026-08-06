@@ -716,13 +716,13 @@ class DCAE(CompressionModel):
 
         self.m_up1 = [swin_block[2](feature_dim[2], feature_dim[2], self.head_dim[3], self.window_size, 0, basic_block[2], block_num=block_num[2])] + \
             [ResidualBottleneckBlockWithUpsample(
-                feature_dim[2], feature_dim[1])]
+                feature_dim[2], feature_dim[1], decoder_nt=False)]
         self.m_up2 = [swin_block[1](feature_dim[1], feature_dim[1], self.head_dim[4], self.window_size, 0, basic_block[1], block_num=block_num[1])] + \
             [ResidualBottleneckBlockWithUpsample(
-                feature_dim[1], feature_dim[0])]
-        self.m_up3 = [swin_block[0](feature_dim[0], feature_dim[0], self.head_dim[5], self.window_size, 0, basic_block[0], block_num=block_num[0], decoder_nt=True)] + \
+                feature_dim[1], feature_dim[0], decoder_nt=False)]
+        self.m_up3 = [swin_block[0](feature_dim[0], feature_dim[0], self.head_dim[5], self.window_size, 0, basic_block[0], block_num=block_num[0], decoder_nt=False)] + \
             [ResidualBottleneckBlockWithUpsample(
-                feature_dim[0], output_image_channel, decoder_nt=False)]
+                feature_dim[0], output_image_channel, decoder_nt=True)]
 
         self.g_a = nn.Sequential(*[ResidualBottleneckBlockWithStride(
             input_image_channel, feature_dim[0])] + self.m_down1 + self.m_down2 + self.m_down3)
