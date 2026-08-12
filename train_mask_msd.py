@@ -25,10 +25,40 @@ from models.dcae_gate import DCAE
 
 import emlnet.decoder as eml_decoder
 import emlnet.resnet as eml_resnet
-from mask_utils import stochastic_mask_fn
+from mask_utils import grass_mask_fn
 from torchvision.utils import save_image
 from PIL import Image
+def gate_bce_loss(gates, mask, pos_weight=None, soften=0.0):
+    """
+    用 grass_mask 逐像素監督 gate(蒸餾)。
+    training 時用 mask 教,推論時 gate 自己會了 —— decoder 不需要 mask。
 
+    gates : (B,K,h,w) 所有注入點的 gate,已過 sigmoid,值域 (0,1)
+    mask  : (B,1,H,W) grass_mask,硬 0/1
+    soften: >0 時做 label smoothing,target 落在 [soften, 1-soften]。
+            硬 0/1 target 會把 sigmoid 推向飽和(logit -> ±inf),
+            之後 gate 就再也動不了。給 0.05 保留一點梯度。
+    """
+    m = F.interpolate(mask, size=gates.shape[-2:],
+                      mode='bilinear', align_corners=False).clamp(0, 1)
+    if soften > 0:
+        m = m * (1.0 - 2 * soften) + soften
+    m = m.expand_as(gates)
+
+    g = gates.clamp(1e-6, 1 - 1e-6)      # 防 log(0)
+
+    if pos_weight is None:
+        loss = F.binary_cross_entropy(g, m)
+    else:
+        # mask cover 只有 ~18%,正樣本稀少;加權避免 gate 直接全關拿低 loss
+        w = 1.0 + (pos_weight - 1.0) * m
+        loss = (F.binary_cross_entropy(g, m, reduction='none') * w).mean()
+
+    # 監控用:mask 內外的平均開度
+    m_bin = (m > 0.5).float()
+    cov_in = ((gates * m_bin).sum() / (m_bin.sum() + 1e-6)).item()
+    cov_out = ((gates * (1 - m_bin)).sum() / ((1 - m_bin).sum() + 1e-6)).item()
+    return loss, cov_in, cov_out
 def calc_tv_loss(x):
     """計算 Total Variation Loss"""
     tv_h = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
@@ -123,9 +153,9 @@ wd_fn = None
 try:
     from wa_wd import VGG16WaveletWassersteinDistortion
     wd_fn = VGG16WaveletWassersteinDistortion(
-        num_levels=5, dwt_levels=1,
+        num_levels=6, dwt_levels=1,
         learnable_weights=False,
-        sigma_offsets=(-0.5, 0.0, 0.0, 0.0),
+        sigma_offsets=(-1.0, 0.5, 0.5, 1.0),
         ll_weight_boost=0.3,
     ).to(DEVICE)
     for p in wd_fn.parameters():
@@ -255,15 +285,34 @@ def configure_optimizers(net, args):
     }
 
     params_dict = dict(net.named_parameters())
-    print(f"[Optimizer] Trainable params: {len(trainable)}")
 
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(trainable)),
-        lr=args.learning_rate,
-    )
+    # gate 參數單獨分組:參數量極少(每個 gate conv 只輸出 1 channel),
+    # Adam 的自適應 lr 會讓它們在幾十步內劇烈移動 -> gate 崩塌。
+    # 用較低 lr 讓它跟著網路慢慢走,而不是被 WD/LPIPS 一腳踩死。
+    gate_names = sorted(n for n in trainable if ".gate_" in n)
+    other_names = sorted(trainable - set(gate_names))
+
+    gate_lr_scale = hasattr(args, "gate_lr_scale") and args.gate_lr_scale or 1
+    gate_lr = args.learning_rate * gate_lr_scale
+    param_groups = [
+        {"params": [params_dict[n] for n in other_names],
+         "lr": args.learning_rate},
+    ]
+    if gate_names:
+        param_groups.append({
+            "params": [params_dict[n] for n in gate_names],
+            "lr": gate_lr,
+        })
+
+    print(f"[Optimizer] Trainable params: {len(trainable)} "
+          f"(gate: {len(gate_names)} @ lr={gate_lr:.2e}, "
+          f"other: {len(other_names)} @ lr={args.learning_rate:.2e})")
+
+    optimizer = optim.AdamW(param_groups)
+
     aux_optimizer = None
     if aux_parameters:
-        aux_optimizer = optim.Adam(
+        aux_optimizer = optim.AdamW(
             (params_dict[n] for n in sorted(aux_parameters)),
             lr=args.aux_learning_rate,
         )
@@ -470,6 +519,28 @@ def parse_args(argv):
                         help="LPIPS backbone network")
     parser.add_argument("--tv-weight", type=float, default=0.0,
                         help="Total Variation loss weight")
+
+# ---- 對比式 MSD:非 mask 區的 diversity 要壓小(防 leak) ----
+    parser.add_argument("--msd-contrast-weight", type=float, default=1.0,
+                        help="對比項權重 lambda_out:非草地(或非gate)區的 diversity 懲罰。"
+                             "0=關閉對比,退回純 div_in。越大越嚴格壓機身/天空 leak。")
+    parser.add_argument("--msd-mask-blur-sigma", type=float, default=2.0,
+                        help="grass_mask 柔化用高斯 sigma。硬 0/1 mask 邊界會造成 diversity 接縫,"
+                             "柔化後草地/機身交界平滑過渡。0=不柔化。")
+    parser.add_argument("--msd-out-eps", type=float, default=0.0,
+                        help="非 mask 區允許的 diversity 容忍值。div_out 超過此值才罰,"
+                             "0=直接壓到最小。給小正值(如0.002)可留一點自然變異。")
+# ---- gate BCE 監督(用 grass_mask 蒸餾進 gate)----
+    parser.add_argument("--gate-weight", type=float, default=0.0,
+                        help="gate BCE 監督權重。>0 才啟用。")
+    parser.add_argument("--gate-pos-weight", type=float, default=4.0,
+                        help="正樣本(mask 內)加權。mask cover ~18%,"
+                             "不加權的話 gate 全關就能拿到低 BCE。")
+    parser.add_argument("--gate-soften", type=float, default=0.05,
+                        help="label smoothing,target 落在 [s, 1-s]。"
+                             "防止 sigmoid 飽和後 gate 死掉。0=硬 0/1")
+    parser.add_argument("--gate-lr-scale", type=float, default=0.1,
+                        help="gate 參數 lr 倍率(相對 --learning-rate)")
     args = parser.parse_args(argv)
     return args
 
@@ -558,6 +629,9 @@ def main(argv):
         if args.comet_name:
             experiment.set_name(args.comet_name)
         experiment.log_parameters(vars(args))
+        experiment.log_code(
+            file_name="/home/at9529/ycw.cs14/Michael/massive_activation/DCAE/models/dcae_gate.py"
+        )
     else:
         experiment = None
 
@@ -712,10 +786,32 @@ def main(argv):
             # ─── Forward ───
             out_net = net(d)
             out_criterion = criterion(out_net, d)
-
+            # ─── grass_mask(MSD 與 gate loss 共用,只算一次)───
+            grass_mask = None
+            need_mask = (args.msd_weight > 0 and not args.msd_use_gate) \
+                        or args.gate_weight > 0
+            if need_mask:
+                with torch.no_grad():
+                    grass_mask = grass_mask_fn(
+                        d, msd_saliency_model,
+                        blur_ks=args.msd_mask_blur_ks,
+                        hf_pct=args.msd_mask_hf_pct,
+                        sal_pct=args.msd_mask_sal_pct,
+                        aniso_ks=args.msd_mask_aniso_ks,
+                        aniso_pct=args.msd_mask_aniso_pct,
+                        use_aniso=args.msd_mask_use_aniso,
+                    )
+                    if args.msd_mask_blur_sigma > 0:
+                        ks = int(2 * round(3 * args.msd_mask_blur_sigma) + 1)
+                        grass_mask = TF.gaussian_blur(
+                            grass_mask, kernel_size=[ks, ks],
+                            sigma=[args.msd_mask_blur_sigma] * 2)
+                    grass_mask = grass_mask.clamp(0, 1)
             # ─── MSD loss ───
+# ─── MSD loss（對比式:div_in 達標 + div_out 壓小防 leak）───
             msd_loss = torch.tensor(0.0, device=device)
-            delta_x = torch.tensor(0.0, device=device)
+            delta_x = torch.tensor(0.0, device=device)     # mask 內 diversity(監控用)
+            div_out = torch.tensor(0.0, device=device)     # mask 外 diversity(監控用)
             gcov = 0.0
             if args.msd_weight > 0:
                 out_net_alt = net(d)
@@ -723,36 +819,48 @@ def main(argv):
                          ).abs().mean(1, keepdim=True)   # (B,1,H,W)
 
                 if args.msd_use_gate:
-                    # ─── 路線 B: gate-weighted ───
+                    # ─── 路線 B: gate-weighted(對稱對比) ───
                     # gate 由 WD/LPIPS 決定,MSD 端 detach,只推 delta 不動 gate
                     gate = out_net.get("gate", None)
                     if gate is None:
-                        # 模型沒吐 gate(理論上不會),退回不加 MSD
                         msd_loss = torch.tensor(0.0, device=device)
                     else:
                         gate_w = gate.detach()
-                        # gate 尺寸可能是 x_hat 的一半,upsample 對齊 delta
                         if gate_w.shape[-2:] != delta.shape[-2:]:
                             gate_w = F.interpolate(
                                 gate_w, size=delta.shape[-2:],
                                 mode='bilinear', align_corners=False)
+                        gate_w = gate_w.clamp(0, 1)
+                        inv_w = 1.0 - gate_w                    # 非注入區
                         gate_sum = gate_w.sum()
+                        inv_sum = inv_w.sum()
                         gcov = gate_w.mean().item()
+
                         if gate_sum < args.msd_gate_min_sum:
                             # gate 幾乎全關,跳過(避免除零 + 沒必要推)
                             msd_loss = torch.tensor(0.0, device=device)
                             delta_x = torch.tensor(0.0, device=device)
                         else:
+                            # div_in:注入區要達標
                             delta_x = (delta * gate_w).sum() / (gate_sum + 1e-6)
                             if args.msd_target_div > 0:
-                                msd_loss = (args.msd_target_div - delta_x).clamp(min=0)
+                                loss_in = (args.msd_target_div - delta_x).clamp(min=0)
                             else:
-                                msd_loss = -torch.log(delta_x + 1e-6)
+                                loss_in = -torch.log(delta_x + 1e-6)
+
+                            # div_out:非注入區壓小(對比項)
+                            if args.msd_contrast_weight > 0 and inv_sum > 1.0:
+                                div_out = (delta * inv_w).sum() / (inv_sum + 1e-6)
+                                loss_out = (div_out - args.msd_out_eps).clamp(min=0)
+                            else:
+                                loss_out = torch.tensor(0.0, device=device)
+
+                            msd_loss = loss_in + args.msd_contrast_weight * loss_out
 
                 else:
-                    # ─── 路線 A: grass-mask ───
+                    # ─── 路線 A: grass-mask(對比式) ───
                     with torch.no_grad():
-                        grass_mask = stochastic_mask_fn(
+                        grass_mask = grass_mask_fn(
                             d, msd_saliency_model,
                             blur_ks=args.msd_mask_blur_ks,
                             hf_pct=args.msd_mask_hf_pct,
@@ -761,14 +869,49 @@ def main(argv):
                             aniso_pct=args.msd_mask_aniso_pct,
                             use_aniso=args.msd_mask_use_aniso,
                         )
-                        
-                    delta_x = (delta * grass_mask).sum() / (grass_mask.sum() + 1e-6)
-                    if args.msd_target_div > 0:
-                        msd_loss = (args.msd_target_div - delta_x).clamp(min=0)
-                    else:
-                        msd_loss = -torch.log(delta_x + 1e-6)
+                        # 柔化硬 0/1 mask,避免草地/機身交界的 diversity 接縫
+                        if args.msd_mask_blur_sigma > 0:
+                            ks = int(2 * round(3 * args.msd_mask_blur_sigma) + 1)  # ~6σ 覆蓋
+                            grass_mask = TF.gaussian_blur(
+                                grass_mask, kernel_size=[ks, ks],
+                                sigma=[args.msd_mask_blur_sigma,
+                                       args.msd_mask_blur_sigma])
+                        grass_mask = grass_mask.clamp(0, 1)
+
+                    inv_mask = 1.0 - grass_mask                 # 非草地(機身/天空)
+                    mask_sum = grass_mask.sum()
+                    inv_sum = inv_mask.sum()
                     gcov = grass_mask.mean().item()
 
+                    # div_in:草地要達標
+                    delta_x = (delta * grass_mask).sum() / (mask_sum + 1e-6)
+                    if args.msd_target_div > 0:
+                        loss_in = (args.msd_target_div - delta_x).clamp(min=0)
+                    else:
+                        loss_in = -torch.log(delta_x + 1e-6)
+
+                    # div_out:非草地壓小(對比項,防 leak)
+                    if args.msd_contrast_weight > 0 and inv_sum > 1.0:
+                        div_out = (delta * inv_mask).sum() / (inv_sum + 1e-6)
+                        loss_out = (div_out - args.msd_out_eps).clamp(min=0)
+                    else:
+                        loss_out = torch.tensor(0.0, device=device)
+
+                    msd_loss = loss_in + args.msd_contrast_weight * loss_out
+# ─── gate coverage loss ───
+            gate_loss = torch.tensor(0.0, device=device)
+            g_cov_in = g_cov_out = 0.0
+            if args.gate_weight > 0 and grass_mask is not None:
+                gates = out_net.get("gates", None)
+                if gates is not None:
+                    gate_loss, g_cov_in, g_cov_out = gate_bce_loss(
+                        gates, grass_mask,
+                        pos_weight=args.gate_pos_weight,
+                        soften=args.gate_soften)
+
+            total_loss = (out_criterion["loss"]
+                          + args.msd_weight * msd_loss
+                          + args.gate_weight * gate_loss)
             # ─── Total loss ───
             total_loss = out_criterion["loss"] + args.msd_weight * msd_loss
 
@@ -823,7 +966,7 @@ def main(argv):
                 print(' | '.join([
                     f"{current_time}",
                     f'Epoch {epoch}',
-                    f'Iter {iterations}',
+                    f'Iter {iterations -1}',
                     f"{i * len(d)}/{len(train_dataloader.dataset)}",
                     f'T {elapsed.val:.3f}({elapsed.avg:.3f})',
                     f'Loss {losses.val:.3f}({losses.avg:.3f})',
@@ -839,8 +982,15 @@ def main(argv):
                     ratio = (args.msd_weight * msd_loss /
                              out_criterion["loss"]).abs()
                     tag = "gate_cover" if args.msd_use_gate else "grass_mask_cover"
-                    print(f"delta_x={delta_x.item():.5f}  msd_loss={msd_loss.item():.4f}  "
+                    print(f"delta_x={delta_x.item():.5f}  div_out={div_out.item():.5f}  "
+                          f"msd_loss={msd_loss.item():.4f}  "
                           f"ratio={ratio.item():.2%}  {tag}={gcov:.2%}")
+
+                if args.gate_weight > 0:
+                    print(f"gate_in={g_cov_in:.4f} gate_out={g_cov_out:.4f} "
+                          f"sep={g_cov_in - g_cov_out:+.4f} "
+                          f"gate_bce={gate_loss.item():.4f}")
+
                 start_time = time.time()
 
                 log_dict = {
@@ -852,14 +1002,20 @@ def main(argv):
                     "train/wd": wd_losses.val,
                     "train/msd": msd_losses.val,
                     "train/aux_loss": aux_losses.val,
+                    "train/msd_div_out": div_out.item(),
                     "lr": optimizer.param_groups[0]['lr'],
                     "weights/mse": criterion.mse_weight,
                     "weights/wd": criterion.wd_weight,
                 }
+                log_dict.update({
+                    "gate/cov_in": g_cov_in,
+                    "gate/cov_out": g_cov_out,
+                    "gate/loss": gate_loss.item(),
+                })
                 log_metrics(experiment, log_dict, step=iterations)
 
             # 驗證
-            if (iterations % 500 == 0 and iterations != 0):
+            if (iterations % 300 == 0 and iterations != 0):
                 print(f"[VAL] iterations={iterations}")
                 net.eval()
 
