@@ -27,6 +27,7 @@ Latent dump / 诊断脚本
        → 信息够，重复是 decoder/loss 的问题，不是信息不足。
 """
 
+from models.dcae_gate import DCAE  # 需与本脚本同目录
 import os
 import sys
 import math
@@ -42,10 +43,131 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
-from models.dcae import DCAE  # 需与本脚本同目录
+
+# ═══════════════════════════════════════════════════════════════
+# 加到 dump_latent.py 裡:取代原本的 dump_noise_scales
+# ═══════════════════════════════════════════════════════════════
+#
+# 重要:last_gate 只有在 forward 跑過之後才有值(見 NoiseInjectedResBlock.forward
+# 最後的 self.last_gate = g_2)。所以這個函式必須在 dump() 之後呼叫,
+# 否則 last_gate 全是 None,只能拿到 noise_scale 拿不到 gate。
+#
 
 
+def dump_gate_and_scales(net, save_dir, x_padded=None, device=None):
+    """
+    印出每個 NoiseInjectedResBlock 的 noise_scale 與 gate 統計。
+
+    net       : DCAE (若是 DataParallel 會自動取 .module)
+    x_padded  : 可選。若提供,會先跑一次 forward 確保 last_gate 有值。
+    """
+    lines = ["", "=== NoiseInjectedResBlock: noise_scale & gate ==="]
+
+    # DataParallel 的話取內層,否則 named_modules 拿到的是複本
+    model = net.module if hasattr(net, "module") else net
+
+    # last_gate 需要 forward 過才會被填。沒跑過就先跑一次。
+    if x_padded is not None:
+        with torch.no_grad():
+            model.eval()
+            model(x_padded)
+
+    rows = []
+    for name, m in model.named_modules():
+        if m.__class__.__name__ != "NoiseInjectedResBlock":
+            continue
+
+        s1 = m.noise_scale1.abs().mean().item()
+        s2 = m.noise_scale2.abs().mean().item()
+
+        g = getattr(m, "last_gate", None)
+        if g is None:
+            lines.append(f"{name}: |s1|={s1:.4f} |s2|={s2:.4f}  "
+                         f"gate=N/A (forward 未跑過)")
+            rows.append((name, s1, s2, None, None, None, None))
+            continue
+
+        g = g.detach().float()
+        g_mean = g.mean().item()
+        g_max = g.max().item()
+        g_min = g.min().item()
+        # 兩極化程度:g*(1-g) 在 0.5 最大(0.25)、在 {0,1} 為 0
+        bimodality = (g * (1 - g)).mean().item()
+        # 有效注入強度 = noise_scale × gate (這才是真正進到 feature 的量)
+        eff = s2 * g_mean
+
+        lines.append(
+            f"{name}:\n"
+            f"    noise_scale  |s1|={s1:.4f}  |s2|={s2:.4f}\n"
+            f"    gate         mean={g_mean:.4f}  min={g_min:.4f}  "
+            f"max={g_max:.4f}\n"
+            f"    bimodality   {bimodality:.4f}  (0.25=全灰/未極化, 0=已二值化)\n"
+            f"    eff_inject   {eff:.4f}  (= |s2| x gate_mean)"
+        )
+        rows.append((name, s1, s2, g_mean, g_min, g_max, bimodality))
+
+    if not rows:
+        lines.append("(沒找到 NoiseInjectedResBlock — 確認 decoder_nt 有開)")
+        _write(lines, save_dir)
+        return
+
+    # ── 自動判讀 ──
+    valid = [r for r in rows if r[3] is not None]
+    lines.append("")
+    lines.append("--- 判讀 ---")
+
+    if valid:
+        gm = [r[3] for r in valid]
+        s2s = [r[2] for r in valid]
+        bim = [r[6] for r in valid]
+
+        lines.append(f"gate_mean  範圍 {min(gm):.4f} ~ {max(gm):.4f}  "
+                     f"(平均 {sum(gm)/len(gm):.4f})")
+        lines.append(f"|scale2|   範圍 {min(s2s):.4f} ~ {max(s2s):.4f}  "
+                     f"(初始值為 1.0)")
+
+        # 1. gate 是否塌掉
+        if max(gm) < 0.02:
+            lines.append(">>> gate 幾乎全關 (<2%)。噪聲沒進到 feature,"
+                         "8 個注入點形同虛設 => 能力問題,先修 gate。")
+        elif max(gm) < 0.05:
+            lines.append(">>> gate 偏低。初始 bias=-2.05 對應 sigmoid≈0.114,"
+                         "若現在遠低於此,代表訓練中被壓下去了。")
+        else:
+            lines.append(">>> gate 有開,噪聲確實有進到 feature。")
+
+        # 2. noise_scale 是否 runaway (補償 gate 縮小)
+        if max(s2s) > 3.0:
+            lines.append(f">>> |scale2| 最大 {max(s2s):.2f} 遠大於初始 1.0 => "
+                         "noise_scale runaway,正在補償縮小的 gate。"
+                         "建議 clamp 或加 weight decay。")
+        elif max(s2s) < 0.2:
+            lines.append(">>> |scale2| 很小 => 噪聲振幅被學死。")
+
+        # 3. 是否極化
+        if sum(bim)/len(bim) > 0.15:
+            lines.append(">>> bimodality 偏高 => gate 停在中間灰帶,沒有兩極化。")
+
+        # 4. 綜合結論
+        if max(gm) >= 0.05 and 0.2 <= max(s2s) <= 3.0:
+            lines.append("")
+            lines.append(">>> 結論:噪聲供給正常(gate 開著、scale 合理)。"
+                         "若輸出仍高度自相似(selfsim ratio>1.3),"
+                         "則是【誘因問題】不是能力問題 => 該加空間多樣性項,"
+                         "而不是再加注入點。")
+
+    _write(lines, save_dir)
+
+
+def _write(lines, save_dir):
+    report = "\n".join(lines)
+    print(report)
+    if save_dir:
+        with open(os.path.join(save_dir, "report.txt"), "a") as f:
+            f.write(report + "\n")
 # ----------------------------- 工具 -----------------------------
+
+
 def pad(x, p=128):
     h, w = x.size(2), x.size(3)
     new_h = (h + p - 1) // p * p
@@ -76,7 +198,7 @@ def dump(net, x_padded, save_dir, device):
         x_hat = out["x_hat"].clamp(0, 1)
         y = out["para"]["y"]           # (B, M, Hy, Wy)  encoder latent
         means = out["para"]["means"]   # (B, M, Hy, Wy)
-        scales = out["para"]["scales"] # (B, M, Hy, Wy)
+        scales = out["para"]["scales"]  # (B, M, Hy, Wy)
 
         B, C, Hy, Wy = y.shape
         H, W = x_padded.shape[2:]
@@ -84,12 +206,14 @@ def dump(net, x_padded, save_dir, device):
 
         # ---- 1) latent 能量热图 & entropy scale ----
         y_energy = y.pow(2).mean(1, keepdim=True)      # (B,1,Hy,Wy) 每位置信息量代理
-        scale_map = scales.mean(1, keepdim=True)       # sigma 大 = 花更多 bit / 更不确定
+        # sigma 大 = 花更多 bit / 更不确定
+        scale_map = scales.mean(1, keepdim=True)
 
         # ---- 2) per-position 真实 bit ----
         # gaussian_conditional 回传 (quantized, likelihoods)
         _, y_like = net.gaussian_conditional(y, scales, means)
-        bits = (-torch.log2(y_like.clamp_min(1e-9))).sum(1, keepdim=True)  # (B,1,Hy,Wy)
+        bits = (-torch.log2(y_like.clamp_min(1e-9))
+                ).sum(1, keepdim=True)  # (B,1,Hy,Wy)
 
         # ---- 存三联图 ----
         x_small = F.interpolate(x_padded, size=(Hy, Wy), mode="bilinear",
@@ -137,10 +261,12 @@ def dump(net, x_padded, save_dir, device):
         grid = max(1, min(Hy, Wy) // 12)  # 大约画 12 条线
         for ly in range(0, Hy + 1, grid):
             axg.axhline(ly * step_px_y, color="cyan", lw=0.5, alpha=0.6)
-            axg.text(2, ly * step_px_y, f"{ly}", color="cyan", fontsize=8, va="top")
+            axg.text(2, ly * step_px_y, f"{ly}",
+                     color="cyan", fontsize=8, va="top")
         for lx in range(0, Wy + 1, grid):
             axg.axvline(lx * step_px_x, color="cyan", lw=0.5, alpha=0.6)
-            axg.text(lx * step_px_x, 2, f"{lx}", color="cyan", fontsize=8, ha="left")
+            axg.text(lx * step_px_x, 2, f"{lx}",
+                     color="cyan", fontsize=8, ha="left")
         axg.set_title(f"x_hat with LATENT-coord grid (latent {Hy}x{Wy}). "
                       f"用这些数字去指定 --grass / --plane 区域")
         axg.axis("off")
@@ -186,7 +312,8 @@ def compare_regions(y, bits, regions, save_dir):
         elif r <= 1.5:
             lines.append(">>> 机制1 不成立：草地 latent 信息量与结构区相当。")
             lines.append(">>> 结论：重复是 decoder/loss 问题（noise 未被奖励），")
-            lines.append(">>>       该动 loss（LPIPS 加权 / sliced-W）或修 NoiseTransform。")
+            lines.append(
+                ">>>       该动 loss（LPIPS 加权 / sliced-W）或修 NoiseTransform。")
         else:
             lines.append(">>> 介于中间：信息略少但非近常数，两方面可能都有贡献。")
 
@@ -200,11 +327,13 @@ def compare_regions(y, bits, regions, save_dir):
 def noise_sensitivity(net, x_padded, save_dir):
     """两次 forward(不同随机 noise)看输出差异 + 存两张原图肉眼比对斜纹。"""
     lines = ["", "=== noise sensitivity (seed diff) ==="]
+
     with torch.no_grad():
         a = net.forward(x_padded)["x_hat"].clamp(0, 1)
         b = net.forward(x_padded)["x_hat"].clamp(0, 1)
         diff = (a - b).abs()
-        lines.append(f"seed diff mean={diff.mean().item():.6f}  max={diff.max().item():.6f}")
+        lines.append(
+            f"seed diff mean={diff.mean().item():.6f}  max={diff.max().item():.6f}")
         if diff.mean().item() < 1e-5:
             lines.append(">>> 输出几乎不随 noise 改变 → noise 被学死。")
         else:
@@ -213,15 +342,21 @@ def noise_sensitivity(net, x_padded, save_dir):
         # ---- 存两张不同 seed 的重建图(肉眼比对斜纹动不动) ----
         plt.imsave(os.path.join(save_dir, "seed_a.png"), to_np_img(a))
         plt.imsave(os.path.join(save_dir, "seed_b.png"), to_np_img(b))
-        lines.append("saved seed_a.png / seed_b.png  (斜纹固定→deterministic; 变→noise)")
+        lines.append(
+            "saved seed_a.png / seed_b.png  (斜纹固定→deterministic; 变→noise)")
 
         # ---- 并排对比图,直接看差异 ----
         fig, ax = plt.subplots(1, 3, figsize=(21, 7))
-        ax[0].imshow(to_np_img(a)); ax[0].set_title("seed A"); ax[0].axis("off")
-        ax[1].imshow(to_np_img(b)); ax[1].set_title("seed B"); ax[1].axis("off")
+        ax[0].imshow(to_np_img(a))
+        ax[0].set_title("seed A")
+        ax[0].axis("off")
+        ax[1].imshow(to_np_img(b))
+        ax[1].set_title("seed B")
+        ax[1].axis("off")
         dmap = diff.mean(1, keepdim=True)[0, 0].cpu()
         im = ax[2].imshow(dmap, cmap="magma")
-        ax[2].set_title("|A - B|"); ax[2].axis("off")
+        ax[2].set_title("|A - B|")
+        ax[2].axis("off")
         plt.colorbar(im, ax=ax[2], fraction=0.046)
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "seed_compare.png"), dpi=120)
@@ -234,6 +369,8 @@ def noise_sensitivity(net, x_padded, save_dir):
         f.write(report + "\n")
 
 # ----------------------------- 打印 noise_scale 学到多少 -----------------------------
+
+
 def dump_noise_scales(net, save_dir):
     lines = ["", "=== NoiseInjectedResBlock noise_scale 值 ==="]
     found = False
@@ -294,7 +431,8 @@ def main(argv):
     os.makedirs(args.save_path, exist_ok=True)
     open(os.path.join(args.save_path, "report.txt"), "w").close()  # 清空
 
-    y, means, scales, bits, (Hy, Wy) = dump(net, x_padded, args.save_path, device)
+    y, means, scales, bits, (Hy, Wy) = dump(
+        net, x_padded, args.save_path, device)
 
     grass = parse_region(args.grass, Hy, Wy)
     plane = parse_region(args.plane, Hy, Wy)
@@ -302,7 +440,7 @@ def main(argv):
     print("※ 若自动区域不准,打开 region_grid.png 读坐标,用 --grass y1,y2,x1,x2 重跑\n")
 
     compare_regions(y, bits, {"grass": grass, "plane": plane}, args.save_path)
-    dump_noise_scales(net, args.save_path)
+    dump_gate_and_scales(net, args.save_path)
     noise_sensitivity(net, x_padded, args.save_path)
 
     print(f"\n全部结果在: {args.save_path}/")
