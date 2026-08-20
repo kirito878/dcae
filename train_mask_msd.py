@@ -153,11 +153,12 @@ wd_fn = None
 try:
     from wa_wd import VGG16WaveletWassersteinDistortion
     wd_fn = VGG16WaveletWassersteinDistortion(
-        num_levels=6, dwt_levels=1,
+        num_levels=4,                          # 6 → 4
+        dwt_levels=1,
         learnable_weights=False,
-        sigma_offsets=(-1.0, 0.5, 0.5, 1.0),
+        sigma_offsets=(-0.5, 0.0, 0.0, 0.5),   # 收窄，配合 clamp
         ll_weight_boost=0.3,
-    ).to(DEVICE)
+    ).to(DEVICE).eval()
     for p in wd_fn.parameters():
         p.requires_grad_(False)
     print("WD loaded.")
@@ -214,7 +215,7 @@ class RateDistortionPerceptualLoss(nn.Module):
             wd_sigma = self.wd_sigma_fn(target)
             log2_sigma = torch.log2(wd_sigma)
             wd_loss = self.wd_fn(
-                output["x_hat"], target, log2_sigma, num_scales=3).mean()
+                output["x_hat"], target, log2_sigma, num_scales=2).mean()
             out["wd_loss"] = wd_loss
         else:
             out["wd_loss"] = torch.tensor(0.0, device=target.device)
@@ -632,6 +633,8 @@ def main(argv):
         experiment.log_code(
             file_name="/home/at9529/ycw.cs14/Michael/massive_activation/DCAE/models/dcae_gate.py"
         )
+        key = experiment.get_key()
+        print(f"[Comet] key={experiment.get_key()}  url={experiment.url}")
     else:
         experiment = None
 
@@ -713,7 +716,7 @@ def main(argv):
             print(f"[Resume] could not read iterations: {e}")
 
     ckpt_name = args.comet_name if args.comet_name else "default"
-    ckpt_epoch_dir = os.path.join("ckpt_epoch", ckpt_name)
+    ckpt_epoch_dir = os.path.join("ckpt_epoch", ckpt_name, experiment.get_key())
     os.makedirs(ckpt_epoch_dir, exist_ok=True)
     print(f"[Ckpt] Per-val checkpoints -> {ckpt_epoch_dir}")
 
@@ -912,8 +915,7 @@ def main(argv):
             total_loss = (out_criterion["loss"]
                           + args.msd_weight * msd_loss
                           + args.gate_weight * gate_loss)
-            # ─── Total loss ───
-            total_loss = out_criterion["loss"] + args.msd_weight * msd_loss
+
 
             if not _criterion_is_finite(out_criterion) or not _is_finite_tensor(total_loss):
                 print(f"[Skip] Non-finite loss at epoch {epoch}, "
